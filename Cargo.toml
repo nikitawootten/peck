@@ -1,0 +1,49 @@
+[package]
+name = "peck"
+version = "0.1.0"
+edition = "2021"
+description = "Vimium-style mouseless navigation for Niri"
+license = "MIT"
+default-run = "peck"
+
+[[bin]]
+name = "peck"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "macros",
+    "net",
+    "sync",
+    "time",
+    "signal",
+] }
+
+atspi = { version = "0.30", features = ["tokio"] }
+
+# niri IPC — version-tracks niri itself, not Rust semver. Pinned to the
+# kiryl/niri PR #4147 commit ("ipc: expose workspace scrolling view position"),
+# which the running niri is built from: the crates.io 26.4.0 release lacks
+# `Workspace::scrolling_view_pos`, which geometry.rs needs to place tiled windows.
+niri-ipc = { git = "https://github.com/kiryl/niri.git", rev = "d26ab5f29df670110a91a7e933a743eeaf611978" }
+
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+smithay-client-toolkit = { version = "0.20", default-features = false, features = [
+    "xkbcommon",
+] }
+
+fontdb = "0.23"
+fontdue = "0.9"
+
+clap = { version = "4", features = ["derive"] }
+
+anyhow = "1"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
