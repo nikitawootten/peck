@@ -29,14 +29,12 @@ atspi = { version = "0.30", features = ["tokio"] }
 niri-ipc = { git = "https://github.com/kiryl/niri.git", rev = "d26ab5f29df670110a91a7e933a743eeaf611978" }
 
 wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-smithay-client-toolkit = { version = "0.20", default-features = false, features = [
-    "xkbcommon",
-] }
+smithay-client-toolkit = { version = "0.20", default-features = false }
 
-fontdb = "0.23"
-fontdue = "0.9"
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+gtk4-layer-shell = "0.8"
+nucleo-matcher = "0.3"
 
 clap = { version = "4", features = ["derive"] }
 

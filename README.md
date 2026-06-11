@@ -5,6 +5,8 @@ Vimium-style mouseless navigation for [Niri](https://github.com/YaLTeR/niri).
 > [!IMPORTANT]
 > This is experimental software. Expect things to break.
 
+![panel mode screenshot](docs/assets/panel-mode.png)
+
 ## Prerequisites
 
 ### Niri version
@@ -53,11 +55,15 @@ binds {
 
 The `--mode` flag can be used to specify the action that should be taken on selection.
 This includes:
+- `panel` (default)
 - `left_click`
 - `right_click`
 - `double_click`
 - `middle_click`
-- `warp`: move the cursor to the selected element
+- `warp`
+
+`panel` mode is the default and provides a fuzzy-searchable view of accessible elements.
+Other modes provide the hints interface without the fuzzy search.
 
 ## Inspiration / Related Work
 

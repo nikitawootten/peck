@@ -11,7 +11,10 @@
           (system: f { inherit system; pkgs = nixpkgs.legacyPackages.${system}; });
 
       nativeBuildInputs = pkgs: [ pkgs.pkg-config ];
-      buildInputs = pkgs: [ pkgs.wayland pkgs.libxkbcommon ];
+      buildInputs = pkgs: [
+        pkgs.gtk4
+        pkgs.gtk4-layer-shell
+      ];
 
       peckFor = pkgs: pkgs.rustPlatform.buildRustPackage {
         pname = "peck";

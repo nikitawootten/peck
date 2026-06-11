@@ -23,9 +23,6 @@ fn is_actionable(role: Role) -> bool {
             | Role::SpinButton
             | Role::Entry
             | Role::PasswordText
-            | Role::ListItem
-            | Role::TreeItem
-            | Role::TableCell
     )
 }
 
