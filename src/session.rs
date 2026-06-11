@@ -8,8 +8,63 @@ use crate::geometry::{self, PhysicalRect};
 use crate::hints::{self, Hint};
 use crate::instrument::Phase;
 use crate::niri::{self, WindowGeometry};
-use crate::overlay;
 use crate::pointer::{self, Mode};
+use crate::ui::UiHandle;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum Request {
+    /// Click the selected element (prefers its semantic AT-SPI action).
+    #[value(name = "left_click")]
+    LeftClick,
+    /// Right-click the selected element.
+    #[value(name = "right_click")]
+    RightClick,
+    /// Middle-click the selected element.
+    #[value(name = "middle_click")]
+    MiddleClick,
+    /// Double-click the selected element.
+    #[value(name = "double_click")]
+    DoubleClick,
+    /// Warp the cursor to the selected element without clicking.
+    #[value(name = "warp")]
+    Warp,
+    /// Open the panel: a fuzzy-searchable element list plus hints; the chosen
+    /// element is highlighted first and acted on with a second key.
+    #[default]
+    #[value(name = "panel")]
+    Panel,
+}
+
+impl Request {
+    /// The gesture this request dispatches, or `None` for the panel.
+    pub fn gesture(self) -> Option<Mode> {
+        match self {
+            Request::LeftClick => Some(Mode::LeftClick),
+            Request::RightClick => Some(Mode::RightClick),
+            Request::MiddleClick => Some(Mode::MiddleClick),
+            Request::DoubleClick => Some(Mode::DoubleClick),
+            Request::Warp => Some(Mode::Warp),
+            Request::Panel => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Request::LeftClick => "left_click",
+            Request::RightClick => "right_click",
+            Request::MiddleClick => "middle_click",
+            Request::DoubleClick => "double_click",
+            Request::Warp => "warp",
+            Request::Panel => "panel",
+        }
+    }
+}
+
+impl fmt::Display for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 pub struct Session {
     a11y: AccessibilityConnection,
@@ -38,10 +93,30 @@ impl Session {
     /// coordinates: AT-SPI window-relative extents corrected via niri's
     /// focused-window geometry.
     pub async fn located_elements(&self) -> Result<(WindowGeometry, Vec<(Element, PhysicalRect)>)> {
+        let geom = {
+            let _p = Phase::start("niri");
+            niri::focused_window_geometry().context("failed to resolve focused-window geometry")?
+        };
+        let located = self.located_in(&geom).await?;
+        Ok((geom, located))
+    }
+
+    /// Enumerate actionable elements within an already-resolved window
+    /// geometry. Errors when the focused window exposes no accessibility
+    /// frame — panel mode treats that as an empty element list instead.
+    async fn located_in(&self, geom: &WindowGeometry) -> Result<Vec<(Element, PhysicalRect)>> {
         let frame = tree::active_frame(&self.a11y)
             .await?
             .context("no active toplevel frame found (is a window focused, and a11y enabled?)")?;
+        self.located_in_frame(geom, frame).await
+    }
 
+    /// Enumerate actionable elements under a known toplevel frame.
+    async fn located_in_frame(
+        &self,
+        geom: &WindowGeometry,
+        frame: atspi::ObjectRefOwned,
+    ) -> Result<Vec<(Element, PhysicalRect)>> {
         // Some toolkits (Firefox/Wayland) report window-relative coordinates
         // against their CSD-shadow-inclusive *surface*, so the frame's own
         // window-relative origin is non-zero (e.g. (20,20)) while niri's window
@@ -61,17 +136,12 @@ impl Session {
             tree::walk(&self.a11y, frame).await?
         };
 
-        let geom = {
-            let _p = Phase::start("niri");
-            niri::focused_window_geometry().context("failed to resolve focused-window geometry")?
-        };
-
         let _p = Phase::start("extents");
         let mut located = Vec::with_capacity(elements.len());
         for el in elements {
             match extents::window_extents(&self.a11y, &el.object).await {
                 Ok((x, y, w, h)) => {
-                    let rect = geometry::correct((x - fx, y - fy, w, h), &geom);
+                    let rect = geometry::correct((x - fx, y - fy, w, h), geom);
                     located.push((el, rect));
                 }
                 Err(e) => {
@@ -80,24 +150,30 @@ impl Session {
             }
         }
 
-        Ok((geom, located))
+        Ok(located)
     }
 
-    /// Run one full activation: resolve the focused window's actionable
-    /// elements, show the hint overlay, and dispatch whatever the user selects.
-    ///
-    /// This is the single pipeline shared by `oneshot` and the daemon — the
-    /// daemon simply calls it once per `peck activate` request, reusing the warm
-    /// AT-SPI connection this `Session` already holds. `mode` selects the
-    /// gesture dispatched on the chosen target.
-    pub async fn activate(&self, mode: Mode) -> Result<Activation> {
+    /// Run one full activation, shared by `oneshot` and the daemon (which
+    /// calls it once per `peck activate` request, reusing the warm AT-SPI
+    /// connection this `Session` already holds).
+    pub async fn activate(&self, ui: &UiHandle, request: Request) -> Result<Activation> {
+        match request.gesture() {
+            Some(mode) => self.activate_gesture(ui, mode).await,
+            None => self.activate_panel(ui).await,
+        }
+    }
+
+    /// Gesture activation: resolve the focused window's actionable elements,
+    /// show the hint overlay (via the UI thread), and dispatch `mode` on
+    /// whatever the user selects.
+    async fn activate_gesture(&self, ui: &UiHandle, mode: Mode) -> Result<Activation> {
         let (geom, located) = self.located_elements().await?;
         let hints = hints::assign(&located);
         if hints.is_empty() {
             return Ok(Activation::NoElements);
         }
 
-        let Some(hint) = overlay::select(&geom, &hints)? else {
+        let Some(hint) = ui.select_hint(geom.clone(), hints).await? else {
             return Ok(Activation::Cancelled);
         };
 
@@ -106,6 +182,69 @@ impl Session {
             element: hint.element,
             how,
         })
+    }
+
+    /// While the panel is open, scrolling invalidates element positions; the
+    /// panel asks for a re-scan over `refetch` when the user releases Ctrl.
+    async fn activate_panel(&self, ui: &UiHandle) -> Result<Activation> {
+        let geom = {
+            let _p = Phase::start("niri");
+            niri::focused_window_geometry().context("failed to resolve focused-window geometry")?
+        };
+        // Resolve the a11y frame once, while the app still holds focus: the
+        // panel takes exclusive keyboard focus once mapped, so the app loses
+        // AT-SPI `State::Active` and an active-frame search during a re-scan
+        // would always come up empty.
+        let frame = match tree::active_frame(&self.a11y).await {
+            Ok(Some(frame)) => Some(frame),
+            Ok(None) => {
+                tracing::info!("panel: no active a11y frame; opening empty");
+                None
+            }
+            Err(e) => {
+                tracing::info!(error = %e, "panel: a11y unavailable; opening empty");
+                None
+            }
+        };
+        let hints = hints::assign(&self.located_or_empty(&geom, frame.clone()).await);
+
+        let (refetch_tx, mut refetch_rx) = tokio::sync::mpsc::channel::<crate::ui::HintsReply>(1);
+        let panel = ui.run_panel(geom.clone(), hints, refetch_tx);
+        tokio::pin!(panel);
+        let mut refetch_open = true;
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut panel => break outcome?,
+                request = refetch_rx.recv(), if refetch_open => match request {
+                    Some(reply) => {
+                        let located = self.located_or_empty(&geom, frame.clone()).await;
+                        let _ = reply.send(hints::assign(&located));
+                    }
+                    // Sender dropped: the panel is tearing down.
+                    None => refetch_open = false,
+                },
+            }
+        };
+        Ok(Activation::Panel(outcome))
+    }
+
+    /// `located_in_frame`, degrading a missing frame or a11y failure to
+    /// "no elements" (panel mode).
+    async fn located_or_empty(
+        &self,
+        geom: &WindowGeometry,
+        frame: Option<atspi::ObjectRefOwned>,
+    ) -> Vec<(Element, PhysicalRect)> {
+        let Some(frame) = frame else {
+            return Vec::new();
+        };
+        match self.located_in_frame(geom, frame).await {
+            Ok(located) => located,
+            Err(e) => {
+                tracing::info!(error = %e, "panel: no accessible elements");
+                Vec::new()
+            }
+        }
     }
 
     /// Dispatch `mode` on the selected hint.
@@ -160,6 +299,51 @@ impl fmt::Display for Dispatched {
     }
 }
 
+/// How a panel interaction ended.
+#[derive(Debug)]
+pub enum PanelOutcome {
+    /// Dismissed without acting on an element (scrolling/warping may still
+    /// have happened).
+    Dismissed { scrolls: u32, warped: bool },
+    /// Left-clicked (possibly double-clicked) the selected element.
+    Clicked {
+        element: Element,
+        at: (i32, i32),
+        double: bool,
+    },
+    /// Right-clicked the selected element.
+    RightClicked { element: Element, at: (i32, i32) },
+}
+
+impl fmt::Display for PanelOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PanelOutcome::Dismissed { scrolls, warped } => {
+                write!(f, "panel dismissed (scrolls: {scrolls}, warped: {warped})")
+            }
+            PanelOutcome::Clicked {
+                element,
+                at: (x, y),
+                double,
+            } => write!(
+                f,
+                "panel: {} {:?} {:?} at ({x}, {y})",
+                if *double { "double-clicked" } else { "clicked" },
+                element.role,
+                element.name,
+            ),
+            PanelOutcome::RightClicked {
+                element,
+                at: (x, y),
+            } => write!(
+                f,
+                "panel: right-clicked {:?} {:?} at ({x}, {y})",
+                element.role, element.name,
+            ),
+        }
+    }
+}
+
 /// The outcome of one [`Session::activate`], renderable as a single status line
 /// (printed by `oneshot`, sent over the socket by the daemon).
 #[derive(Debug)]
@@ -170,6 +354,8 @@ pub enum Activation {
     Cancelled,
     /// A target was selected and dispatched.
     Activated { element: Element, how: Dispatched },
+    /// A panel interaction finished.
+    Panel(PanelOutcome),
 }
 
 impl fmt::Display for Activation {
@@ -184,6 +370,38 @@ impl fmt::Display for Activation {
                 element.name,
                 element.object.path()
             ),
+            Activation::Panel(outcome) => outcome.fmt(f),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::ValueEnum;
+
+    /// The socket protocol is the `Request` value-enum names: the new `panel`
+    /// line parses, legacy gesture lines keep their meaning, and garbage is
+    /// rejected (the daemon then falls back to the default).
+    #[test]
+    fn request_parses_socket_lines() {
+        assert_eq!(Request::from_str("panel", false), Ok(Request::Panel));
+        assert_eq!(
+            Request::from_str("left_click", false),
+            Ok(Request::LeftClick)
+        );
+        assert_eq!(
+            Request::from_str("double_click", false),
+            Ok(Request::DoubleClick)
+        );
+        assert_eq!(Request::from_str("warp", false), Ok(Request::Warp));
+        assert!(Request::from_str("does-not-exist", false).is_err());
+    }
+
+    #[test]
+    fn request_round_trips_through_display() {
+        for r in Request::value_variants() {
+            assert_eq!(Request::from_str(&r.to_string(), false), Ok(*r));
         }
     }
 }

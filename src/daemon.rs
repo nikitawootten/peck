@@ -6,8 +6,8 @@ use clap::ValueEnum;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::pointer::Mode;
-use crate::session::Session;
+use crate::session::{Request, Session};
+use crate::ui::UiHandle;
 
 /// Socket path: `$XDG_RUNTIME_DIR/peck.sock`, falling back to the temp dir.
 fn socket_path() -> PathBuf {
@@ -18,7 +18,7 @@ fn socket_path() -> PathBuf {
 }
 
 /// Bind the socket and serve activations until interrupted.
-pub async fn run() -> Result<()> {
+pub async fn run(ui: UiHandle) -> Result<()> {
     let session = Session::new().await?;
     let path = socket_path();
 
@@ -27,7 +27,7 @@ pub async fn run() -> Result<()> {
         .with_context(|| format!("failed to bind peck socket at {}", path.display()))?;
     tracing::info!(socket = %path.display(), "peck daemon ready; bind `peck activate` to a key");
 
-    let result = serve(&listener, |stream| handle(&session, stream)).await;
+    let result = serve(&listener, |stream| handle(&session, &ui, stream)).await;
 
     let _ = std::fs::remove_file(&path);
     result
@@ -93,7 +93,7 @@ where
 }
 
 /// Handle one client connection
-async fn handle(session: &Session, mut stream: UnixStream) -> Result<()> {
+async fn handle(session: &Session, ui: &UiHandle, mut stream: UnixStream) -> Result<()> {
     let mut request = Vec::new();
     stream
         .read_to_end(&mut request)
@@ -104,10 +104,10 @@ async fn handle(session: &Session, mut stream: UnixStream) -> Result<()> {
     // (including an empty line from an older client) falls back to the default.
     let mode = std::str::from_utf8(&request)
         .ok()
-        .and_then(|s| Mode::from_str(s.trim(), false).ok())
+        .and_then(|s| Request::from_str(s.trim(), false).ok())
         .unwrap_or_default();
 
-    match session.activate(mode).await {
+    match session.activate(ui, mode).await {
         Ok(outcome) => {
             tracing::info!(%outcome, "activation complete");
             stream
@@ -141,7 +141,7 @@ async fn bind_fresh(path: &Path) -> Result<()> {
 }
 
 /// Connect to the running daemon and trigger one activation
-pub async fn activate(mode: Mode) -> Result<()> {
+pub async fn activate(mode: Request) -> Result<()> {
     let path = socket_path();
     let mut stream = UnixStream::connect(&path).await.with_context(|| {
         format!(

@@ -4,15 +4,14 @@ mod geometry;
 mod hints;
 mod instrument;
 mod niri;
-mod overlay;
 mod pointer;
 mod session;
+mod ui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use pointer::Mode;
-use session::Session;
+use session::{Request, Session};
 
 #[derive(Parser)]
 #[command(
@@ -32,16 +31,16 @@ enum Command {
 
     /// Run a single activation and exit.
     Oneshot {
-        /// Gesture to dispatch on the selected target.
-        #[arg(long, value_enum, default_value_t = Mode::default())]
-        mode: Mode,
+        /// Gesture to dispatch on the selected target, or `panel`.
+        #[arg(long, value_enum, default_value_t = Request::default())]
+        mode: Request,
     },
 
     /// Trigger the daemon
     Activate {
-        /// Gesture to dispatch on the selected target.
-        #[arg(long, value_enum, default_value_t = Mode::default())]
-        mode: Mode,
+        /// Gesture to dispatch on the selected target, or `panel`.
+        #[arg(long, value_enum, default_value_t = Request::default())]
+        mode: Request,
     },
 
     /// Print `role | name | object-path` for each actionable element and exit.
@@ -54,26 +53,24 @@ enum Command {
 fn main() -> Result<()> {
     instrument::init();
     let cli = Cli::parse();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    rt.block_on(run(cli.command))
-}
-
-async fn run(command: Command) -> Result<()> {
-    match command {
-        Command::Oneshot { mode } => show_overlay_cmd(&Session::new().await?, mode).await,
-        Command::DumpTree => dump_tree_cmd(&Session::new().await?).await,
-        Command::DumpCoords => dump_coords_cmd(&Session::new().await?).await,
-        Command::Daemon => daemon::run().await,
-        Command::Activate { mode } => daemon::activate(mode).await,
+    match cli.command {
+        Command::Daemon => ui::run(|ui| async move { daemon::run(ui).await }),
+        Command::Oneshot { mode } => ui::run(move |ui| async move {
+            let session = Session::new().await?;
+            println!("{}", session.activate(&ui, mode).await?);
+            Ok(())
+        }),
+        Command::Activate { mode } => block_on(daemon::activate(mode)),
+        Command::DumpTree => block_on(async { dump_tree_cmd(&Session::new().await?).await }),
+        Command::DumpCoords => block_on(async { dump_coords_cmd(&Session::new().await?).await }),
     }
 }
 
-async fn show_overlay_cmd(session: &Session, mode: Mode) -> Result<()> {
-    println!("{}", session.activate(mode).await?);
-    Ok(())
+fn block_on<Fut: std::future::Future<Output = Result<()>>>(fut: Fut) -> Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(fut)
 }
 
 /// Diagnostic: dump the actionable elements of the focused window.
