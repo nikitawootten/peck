@@ -11,6 +11,7 @@ mod ui;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use hints::HintStyle;
 use session::{Request, Session};
 
 #[derive(Parser)]
@@ -34,6 +35,10 @@ enum Command {
         /// Gesture to dispatch on the selected target, or `panel`.
         #[arg(long, value_enum, default_value_t = Request::default())]
         mode: Request,
+
+        /// Hint label style.
+        #[arg(long, value_enum, default_value_t = HintStyle::default())]
+        hints: HintStyle,
     },
 
     /// Trigger the daemon
@@ -41,6 +46,10 @@ enum Command {
         /// Gesture to dispatch on the selected target, or `panel`.
         #[arg(long, value_enum, default_value_t = Request::default())]
         mode: Request,
+
+        /// Hint label style.
+        #[arg(long, value_enum, default_value_t = HintStyle::default())]
+        hints: HintStyle,
     },
 
     /// Print `role | name | object-path` for each actionable element and exit.
@@ -55,12 +64,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Daemon => ui::run(|ui| async move { daemon::run(ui).await }),
-        Command::Oneshot { mode } => ui::run(move |ui| async move {
+        Command::Oneshot { mode, hints } => ui::run(move |ui| async move {
             let session = Session::new().await?;
-            println!("{}", session.activate(&ui, mode).await?);
+            println!("{}", session.activate(&ui, mode, hints).await?);
             Ok(())
         }),
-        Command::Activate { mode } => block_on(daemon::activate(mode)),
+        Command::Activate { mode, hints } => block_on(daemon::activate(mode, hints)),
         Command::DumpTree => block_on(async { dump_tree_cmd(&Session::new().await?).await }),
         Command::DumpCoords => block_on(async { dump_coords_cmd(&Session::new().await?).await }),
     }

@@ -5,7 +5,7 @@ use std::fmt;
 
 use crate::atspi::{action, extents, tree, Element};
 use crate::geometry::{self, PhysicalRect};
-use crate::hints::{self, Hint};
+use crate::hints::{self, Hint, HintStyle};
 use crate::instrument::Phase;
 use crate::niri::{self, WindowGeometry};
 use crate::pointer::{self, Mode};
@@ -156,19 +156,29 @@ impl Session {
     /// Run one full activation, shared by `oneshot` and the daemon (which
     /// calls it once per `peck activate` request, reusing the warm AT-SPI
     /// connection this `Session` already holds).
-    pub async fn activate(&self, ui: &UiHandle, request: Request) -> Result<Activation> {
+    pub async fn activate(
+        &self,
+        ui: &UiHandle,
+        request: Request,
+        style: HintStyle,
+    ) -> Result<Activation> {
         match request.gesture() {
-            Some(mode) => self.activate_gesture(ui, mode).await,
-            None => self.activate_panel(ui).await,
+            Some(mode) => self.activate_gesture(ui, mode, style).await,
+            None => self.activate_panel(ui, style).await,
         }
     }
 
     /// Gesture activation: resolve the focused window's actionable elements,
     /// show the hint overlay (via the UI thread), and dispatch `mode` on
     /// whatever the user selects.
-    async fn activate_gesture(&self, ui: &UiHandle, mode: Mode) -> Result<Activation> {
+    async fn activate_gesture(
+        &self,
+        ui: &UiHandle,
+        mode: Mode,
+        style: HintStyle,
+    ) -> Result<Activation> {
         let (geom, located) = self.located_elements().await?;
-        let hints = hints::assign(&located);
+        let hints = hints::assign(&located, style);
         if hints.is_empty() {
             return Ok(Activation::NoElements);
         }
@@ -186,7 +196,7 @@ impl Session {
 
     /// While the panel is open, scrolling invalidates element positions; the
     /// panel asks for a re-scan over `refetch` when the user releases Ctrl.
-    async fn activate_panel(&self, ui: &UiHandle) -> Result<Activation> {
+    async fn activate_panel(&self, ui: &UiHandle, style: HintStyle) -> Result<Activation> {
         let geom = {
             let _p = Phase::start("niri");
             niri::focused_window_geometry().context("failed to resolve focused-window geometry")?
@@ -206,7 +216,7 @@ impl Session {
                 None
             }
         };
-        let hints = hints::assign(&self.located_or_empty(&geom, frame.clone()).await);
+        let hints = hints::assign(&self.located_or_empty(&geom, frame.clone()).await, style);
 
         let (refetch_tx, mut refetch_rx) = tokio::sync::mpsc::channel::<crate::ui::HintsReply>(1);
         let panel = ui.run_panel(geom.clone(), hints, refetch_tx);
@@ -218,7 +228,7 @@ impl Session {
                 request = refetch_rx.recv(), if refetch_open => match request {
                     Some(reply) => {
                         let located = self.located_or_empty(&geom, frame.clone()).await;
-                        let _ = reply.send(hints::assign(&located));
+                        let _ = reply.send(hints::assign(&located, style));
                     }
                     // Sender dropped: the panel is tearing down.
                     None => refetch_open = false,

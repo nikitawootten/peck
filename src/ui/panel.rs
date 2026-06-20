@@ -1,4 +1,5 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -395,9 +396,12 @@ impl PanelCore {
 ///
 /// Horizontally centered on the focused window. Vertically, nine candidate
 /// slots spanning the window's height are scored by the lexicographic key
-/// (total overlap area with the hint chips, distance from the window's
-/// vertical center): a zero-overlap slot always beats a more central one,
-/// and among equals the most central wins.
+/// (total overlap area with the hint chips, in-window preference, distance
+/// from the window's center): a zero-overlap slot always beats a more
+/// central one, and among equals the most central wins. When every
+/// in-window slot is covered by chips (a dense page), slots beside the
+/// window  compete too, so the panel moves off the window entirely if the
+/// output has room.
 pub fn place_panel(
     panel: (f64, f64),
     window: (f64, f64, f64, f64),
@@ -407,23 +411,57 @@ pub fn place_panel(
     let (pw, ph) = panel;
     let (wx, wy, ww, wh) = window;
     let (ow, oh) = output;
-
-    let x = (wx + (ww - pw) / 2.0).clamp(MARGIN, (ow - pw - MARGIN).max(MARGIN));
+    let clamp_x = |x: f64| x.clamp(MARGIN, (ow - pw - MARGIN).max(MARGIN));
+    let clamp_y = |y: f64| y.clamp(MARGIN, (oh - ph - MARGIN).max(MARGIN));
 
     const SLOTS: usize = 9;
+    let cx = clamp_x(wx + (ww - pw) / 2.0);
     let span = (wh - ph).max(0.0);
-    let window_center = wy + wh / 2.0;
-    let mut best = (f64::INFINITY, f64::INFINITY, wy);
-    for i in 0..SLOTS {
-        let y = wy + span * i as f64 / (SLOTS - 1) as f64;
+    let in_window = (0..SLOTS).map(|i| {
+        (
+            cx,
+            clamp_y(wy + span * i as f64 / (SLOTS - 1) as f64),
+            false,
+        )
+    });
+    let side_y = clamp_y(wy + (wh - ph) / 2.0);
+    let beside = [wx + ww + MARGIN, wx - pw - MARGIN]
+        .into_iter()
+        .filter(|&x| x >= MARGIN && x + pw <= ow - MARGIN)
+        .map(move |x| (x, side_y, true));
+
+    // Scored slot: ((overlap, beside, distance) sort key, (x, y) corner).
+    type Scored = ((f64, bool, f64), (f64, f64));
+    let (wcx, wcy) = (wx + ww / 2.0, wy + wh / 2.0);
+    let mut best: Option<Scored> = None;
+    for (x, y, beside) in in_window.chain(beside) {
         let overlap: f64 = chips.iter().map(|c| overlap_area((x, y, pw, ph), *c)).sum();
-        let dist = (y + ph / 2.0 - window_center).abs();
-        if (overlap, dist) < (best.0, best.1) {
-            best = (overlap, dist, y);
+        let dist = (x + pw / 2.0 - wcx).hypot(y + ph / 2.0 - wcy);
+        let key = (overlap, beside, dist);
+        if best.as_ref().is_none_or(|b| key < b.0) {
+            best = Some((key, (x, y)));
         }
     }
-    let y = best.2.clamp(MARGIN, (oh - ph - MARGIN).max(MARGIN));
-    (x, y)
+    // SLOTS >= 1, so at least the first in-window slot is always present.
+    best.unwrap().1
+}
+
+fn scroll_into_view(
+    scroller: &gtk::ScrolledWindow,
+    list: &gtk::ListBox,
+    row: &gtk::ListBoxRow,
+) -> bool {
+    let Some(b) = row.compute_bounds(list) else {
+        return false;
+    };
+    let (top, bottom) = (f64::from(b.y()), f64::from(b.y() + b.height()));
+    let va = scroller.vadjustment();
+    if top < va.value() {
+        va.set_value(top);
+    } else if bottom > va.value() + va.page_size() {
+        va.set_value(bottom - va.page_size());
+    }
+    true
 }
 
 /// A non-selectable text row: section header ("hints" / "matches") or the
@@ -574,11 +612,33 @@ pub async fn run(
     let core = Rc::new(RefCell::new(PanelCore::new(items)));
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Event>();
 
+    // Set while a frame-clock callback is pending to scroll the selection
+    // into view; keeps render from stacking duplicate callbacks.
+    let scroll_armed = Rc::new(Cell::new(false));
+
+    // Signature of what the list last displayed: the row widgets are rebuilt
+    // only when this changes, so a pure selection move (e.g. held Down) keeps
+    // the existing, already-laid-out rows and scrolls synchronously instead of
+    // racing a fresh layout. Fields: (label matches, fuzzy matches, typed-out
+    // hint, stale flag, whether any elements exist).
+    type RenderSig = (Vec<usize>, Vec<usize>, Option<usize>, bool, bool);
+    let last_render: Rc<RefCell<Option<RenderSig>>> = Rc::new(RefCell::new(None));
+
+    // Item index → its laid-out row, rebuilt in lockstep with the list rows.
+    // Lets the selection step (which runs every frame, including on moves that
+    // don't rebuild) map the core's selected item straight to its row without
+    // re-deriving the header-aware row order.
+    let rows_by_item: Rc<RefCell<HashMap<usize, gtk::ListBoxRow>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+
     // Render the status line and sectioned list, and sync the hints overlay
     // with the selection. The status text is derived from core state here so
     // no effect arm has to mutate (and later restore) it by hand.
     let render = {
         let core = core.clone();
+        let scroll_armed = scroll_armed.clone();
+        let last_render = last_render.clone();
+        let rows_by_item = rows_by_item.clone();
         let list = list.clone();
         let scroller = scroller.clone();
         let status = status.clone();
@@ -594,58 +654,85 @@ pub async fn run(
                 STATUS_LEGEND
             });
 
-            list.remove_all();
-            {
-                let hints = &overlay.state.borrow().hints;
+            let empty = core.label_matches.is_empty() && core.fuzzy_matches.is_empty();
+            let hints_empty = overlay.state.borrow().hints.is_empty();
 
-                if core.label_matches.is_empty() && core.fuzzy_matches.is_empty() {
+            let changed = match last_render.borrow().as_ref() {
+                Some((l, f, h, s, he)) => {
+                    l != &core.label_matches
+                        || f != &core.fuzzy_matches
+                        || *h != core.hint_match
+                        || *s != core.stale
+                        || *he != hints_empty
+                }
+                None => true,
+            };
+            if changed {
+                *last_render.borrow_mut() = Some((
+                    core.label_matches.clone(),
+                    core.fuzzy_matches.clone(),
+                    core.hint_match,
+                    core.stale,
+                    hints_empty,
+                ));
+                list.remove_all();
+                let mut rows = rows_by_item.borrow_mut();
+                rows.clear();
+                let hints = &overlay.state.borrow().hints;
+                if empty {
                     let text = if core.stale {
                         "release ⌃ to re-scan"
-                    } else if hints.is_empty() {
+                    } else if hints_empty {
                         "no accessible elements — ⌃hjkl scrolls"
                     } else {
                         "no matches"
                     };
                     list.append(&inert_row(text, "peck-empty", 0.5));
                 } else {
-                    let selected = core.selected();
-                    // ListBox row index of the selection (headers included).
-                    let mut selected_row = None;
-                    let mut rows = 0;
-                    let mut append = |row: &gtk::ListBoxRow, idx: Option<usize>| {
-                        if idx.is_some() && idx == selected {
-                            selected_row = Some(rows);
-                        }
-                        list.append(row);
-                        rows += 1;
-                    };
-
                     // Hints the query is typing towards, above the fuzzy matches.
                     if !core.label_matches.is_empty() {
-                        append(&inert_row("hints", "peck-section", 0.0), None);
+                        list.append(&inert_row("hints", "peck-section", 0.0));
                         for &idx in &core.label_matches {
-                            let typed_out = core.hint_match == Some(idx);
-                            append(&item_row(&hints[idx], typed_out), Some(idx));
+                            let row = item_row(&hints[idx], core.hint_match == Some(idx));
+                            list.append(&row);
+                            rows.insert(idx, row);
                         }
                         if !core.fuzzy_matches.is_empty() {
-                            append(&inert_row("matches", "peck-section", 0.0), None);
+                            list.append(&inert_row("matches", "peck-section", 0.0));
                         }
                     }
                     for &idx in &core.fuzzy_matches {
-                        append(&item_row(&hints[idx], false), Some(idx));
-                    }
-
-                    if let Some(row_index) = selected_row {
-                        if let Some(row) = list.row_at_index(row_index) {
-                            list.select_row(Some(&row));
-                        }
-                        // Keep the cursor row in view (rows are ~ROW_H tall).
-                        let va = scroller.vadjustment();
-                        va.set_value(
-                            f64::from(row_index) * ROW_H - va.page_size() / 2.0 + ROW_H / 2.0,
-                        );
+                        let row = item_row(&hints[idx], false);
+                        list.append(&row);
+                        rows.insert(idx, row);
                     }
                 }
+            }
+
+            // Select and scroll the cursor row into view
+            match core
+                .selected()
+                .and_then(|idx| rows_by_item.borrow().get(&idx).cloned())
+            {
+                Some(row) => {
+                    list.select_row(Some(&row));
+                    if !scroll_into_view(&scroller, &list, &row) && !scroll_armed.replace(true) {
+                        let scroller = scroller.clone();
+                        let scroll_armed = scroll_armed.clone();
+                        list.add_tick_callback(move |list, _clock| {
+                            let Some(row) = list.selected_row() else {
+                                scroll_armed.set(false);
+                                return glib::ControlFlow::Break;
+                            };
+                            if !scroll_into_view(&scroller, list, &row) {
+                                return glib::ControlFlow::Continue; // not laid out yet
+                            }
+                            scroll_armed.set(false);
+                            glib::ControlFlow::Break
+                        });
+                    }
+                }
+                None => list.select_row(gtk::ListBoxRow::NONE),
             }
 
             // Hint chips: filter by the query prefix; green outline on the
@@ -1128,6 +1215,50 @@ mod tests {
         let panel = (x, y, 400.0, 200.0);
         let overlap: f64 = chips.iter().map(|c| overlap_area(panel, *c)).sum();
         assert_eq!(overlap, 0.0, "a zero-overlap slot exists and must win");
+    }
+
+    #[test]
+    fn placement_falls_back_beside_dense_window() {
+        // One chip blankets the whole window: no in-window slot is clean, so
+        // the panel moves beside the window — right when there's room.
+        let window = (100.0, 50.0, 800.0, 600.0);
+        let chips = vec![window];
+        let (x, y) = place_panel((400.0, 200.0), window, (1920.0, 1080.0), &chips);
+        assert_eq!(x, 100.0 + 800.0 + MARGIN);
+        assert_eq!(y, 50.0 + (600.0 - 200.0) / 2.0);
+
+        // No room on the right: fall back to the left side.
+        let window = (1112.0, 50.0, 800.0, 600.0);
+        let chips = vec![window];
+        let (x, _) = place_panel((400.0, 200.0), window, (1920.0, 1080.0), &chips);
+        assert_eq!(x, 1112.0 - 400.0 - MARGIN);
+    }
+
+    #[test]
+    fn placement_dense_fullscreen_window_stays_on_output() {
+        // Window covers the output and is blanketed by chips: no side fits,
+        // so the least-overlap in-window slot wins and stays on the output.
+        let window = (0.0, 0.0, 1920.0, 1080.0);
+        let chips = vec![window];
+        let (x, y) = place_panel((400.0, 200.0), window, (1920.0, 1080.0), &chips);
+        assert!(x >= MARGIN && x + 400.0 <= 1920.0 - MARGIN + 1e-9);
+        assert!(y >= MARGIN && y + 200.0 <= 1080.0 - MARGIN + 1e-9);
+    }
+
+    #[test]
+    fn placement_prefers_in_window_over_beside() {
+        // A clean in-window slot exists: the side fallback must not win even
+        // though it would also have zero overlap.
+        let window = (100.0, 50.0, 800.0, 600.0);
+        let chips = vec![(100.0, 50.0, 800.0, 200.0)]; // top third only
+        let (x, y) = place_panel((400.0, 200.0), window, (1920.0, 1080.0), &chips);
+        assert_eq!(
+            x,
+            100.0 + (800.0 - 400.0) / 2.0,
+            "stays centered on the window"
+        );
+        let overlap = overlap_area((x, y, 400.0, 200.0), chips[0]);
+        assert_eq!(overlap, 0.0);
     }
 
     #[test]

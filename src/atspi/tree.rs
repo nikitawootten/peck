@@ -120,7 +120,13 @@ pub async fn walk(conn: &AccessibilityConnection, frame: ObjectRefOwned) -> Resu
             });
         }
 
-        for child in proxy.get_children().await.unwrap_or_default() {
+        for child in proxy
+            .get_children()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+        {
             stack.push(child);
         }
     }

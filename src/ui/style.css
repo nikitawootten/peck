@@ -63,8 +63,8 @@ window.peck-panel text placeholder {
 }
 
 .peck-chip-overlay {
-    font-size: 13px;
-    padding: 3px 5px;
+    font-size: 11px;
+    padding: 1px 3px;
     border: 1px solid #101010;
     margin-right: 0;
 }
