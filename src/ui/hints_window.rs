@@ -188,14 +188,22 @@ impl HintsOverlay {
                 chip.remove_css_class("peck-chip-selected");
             }
 
-            // Anchor at the element's top-left, clamped on-screen; nudge down
-            // to avoid overlapping an already-placed chip (or the panel).
+            // Anchor at the element's top-left; if a neighbour's chip (or the
+            // panel) is in the way, slide to the top-right (chip's right edge
+            // on the element's right edge) before nudging down a row, so two
+            // side-by-side elements keep both chips on the top line.
             let (bw, bh) = natural_size(chip);
-            let bx = (hint.rect.x as f64 / st.scale).clamp(0.0, (width - bw).max(0.0));
+            let max_x = (width - bw).max(0.0);
+            let left = (hint.rect.x as f64 / st.scale).clamp(0.0, max_x);
+            let right = ((hint.rect.x + hint.rect.w) as f64 / st.scale - bw).clamp(0.0, max_x);
+            let mut bx = left;
             let mut by = (hint.rect.y as f64 / st.scale).clamp(0.0, (height - bh).max(0.0));
-            for _ in 0..16 {
-                if !placed.iter().any(|r| overlaps((bx, by, bw, bh), *r)) {
-                    break;
+            'place: for _ in 0..16 {
+                for x in [left, right] {
+                    if !placed.iter().any(|r| overlaps((x, by, bw, bh), *r)) {
+                        bx = x;
+                        break 'place;
+                    }
                 }
                 by = (by + bh).min((height - bh).max(0.0));
             }

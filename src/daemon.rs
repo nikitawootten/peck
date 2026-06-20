@@ -6,6 +6,7 @@ use clap::ValueEnum;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::hints::HintStyle;
 use crate::session::{Request, Session};
 use crate::ui::UiHandle;
 
@@ -100,14 +101,9 @@ async fn handle(session: &Session, ui: &UiHandle, mut stream: UnixStream) -> Res
         .await
         .context("failed to read activation request")?;
 
-    // The request is a single line naming the mode; anything unrecognised
-    // (including an empty line from an older client) falls back to the default.
-    let mode = std::str::from_utf8(&request)
-        .ok()
-        .and_then(|s| Request::from_str(s.trim(), false).ok())
-        .unwrap_or_default();
+    let (mode, style) = parse_request(&request);
 
-    match session.activate(ui, mode).await {
+    match session.activate(ui, mode, style).await {
         Ok(outcome) => {
             tracing::info!(%outcome, "activation complete");
             stream
@@ -121,6 +117,20 @@ async fn handle(session: &Session, ui: &UiHandle, mut stream: UnixStream) -> Res
             Err(e)
         }
     }
+}
+
+/// Parse a request line: `<mode> [hint-style]`
+fn parse_request(raw: &[u8]) -> (Request, HintStyle) {
+    let mut tokens = std::str::from_utf8(raw).unwrap_or("").split_whitespace();
+    let mode = tokens
+        .next()
+        .and_then(|t| Request::from_str(t, false).ok())
+        .unwrap_or_default();
+    let style = tokens
+        .next()
+        .and_then(|t| HintStyle::from_str(t, false).ok())
+        .unwrap_or_default();
+    (mode, style)
 }
 
 /// Refuse to start if a *live* daemon already holds the socket; otherwise remove
@@ -141,7 +151,7 @@ async fn bind_fresh(path: &Path) -> Result<()> {
 }
 
 /// Connect to the running daemon and trigger one activation
-pub async fn activate(mode: Request) -> Result<()> {
+pub async fn activate(mode: Request, style: HintStyle) -> Result<()> {
     let path = socket_path();
     let mut stream = UnixStream::connect(&path).await.with_context(|| {
         format!(
@@ -151,7 +161,7 @@ pub async fn activate(mode: Request) -> Result<()> {
     })?;
 
     stream
-        .write_all(format!("{mode}\n").as_bytes())
+        .write_all(format!("{mode} {style}\n").as_bytes())
         .await
         .context("failed to send activation request")?;
     stream.shutdown().await.ok();
@@ -181,6 +191,36 @@ mod tests {
         let mut resp = String::new();
         stream.read_to_string(&mut resp).await.expect("read reply");
         resp
+    }
+
+    /// Socket lines carry `<mode> [hint-style]` (e.g. `panel short`)
+    /// Unrecognised or missing options default gracefully.
+    #[test]
+    fn parse_request_lines() {
+        assert_eq!(
+            parse_request(b"panel short\n"),
+            (Request::Panel, HintStyle::Short)
+        );
+        // Invalid hint-style degrades to default
+        assert_eq!(
+            parse_request(b"left_click uniform\n"),
+            (Request::LeftClick, HintStyle::default())
+        );
+        // Missing hint-style degrades to default
+        assert_eq!(
+            parse_request(b"warp\n"),
+            (Request::Warp, HintStyle::default())
+        );
+        // Missing mode+hint-style degrades to default
+        assert_eq!(
+            parse_request(b"\n"),
+            (Request::default(), HintStyle::default())
+        );
+        // Invalid mode+hint-style degrades to default
+        assert_eq!(
+            parse_request(b"nonsense nonsense\n"),
+            (Request::default(), HintStyle::default())
+        );
     }
 
     /// While one activation is in flight, a second connection must be refused
