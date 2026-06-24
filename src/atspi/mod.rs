@@ -2,9 +2,9 @@ pub mod action;
 pub mod extents;
 pub mod tree;
 
-use atspi::{ObjectRefOwned, Role};
+use atspi::{ObjectRefOwned, Role, StateSet};
 
-/// One actionable UI element discovered in the active application's subtree.
+/// One UI element discovered in the active application's subtree.
 #[derive(Debug, Clone)]
 pub struct Element {
     /// AT-SPI object reference (bus name + object path)
@@ -13,4 +13,6 @@ pub struct Element {
     pub role: Role,
     /// Accessible name (label text)
     pub name: String,
+    /// Accessible state set (showing, visible, enabled, ...).
+    pub states: StateSet,
 }

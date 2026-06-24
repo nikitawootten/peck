@@ -11,6 +11,7 @@ mod ui;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use atspi::tree::is_actionable;
 use hints::HintStyle;
 use session::{Request, Session};
 
@@ -53,7 +54,11 @@ enum Command {
     },
 
     /// Print `role | name | object-path` for each actionable element and exit.
-    DumpTree,
+    DumpTree {
+        /// Include non-actionable elements
+        #[arg(long)]
+        all: bool,
+    },
 
     /// Print each element with corrected global physical coords and exit.
     DumpCoords,
@@ -70,7 +75,9 @@ fn main() -> Result<()> {
             Ok(())
         }),
         Command::Activate { mode, hints } => block_on(daemon::activate(mode, hints)),
-        Command::DumpTree => block_on(async { dump_tree_cmd(&Session::new().await?).await }),
+        Command::DumpTree { all } => {
+            block_on(async { dump_tree_cmd(&Session::new().await?, all).await })
+        }
         Command::DumpCoords => block_on(async { dump_coords_cmd(&Session::new().await?).await }),
     }
 }
@@ -82,11 +89,15 @@ fn block_on<Fut: std::future::Future<Output = Result<()>>>(fut: Fut) -> Result<(
         .block_on(fut)
 }
 
-/// Diagnostic: dump the actionable elements of the focused window.
-async fn dump_tree_cmd(session: &Session) -> Result<()> {
-    let elements = session.actionable_elements().await?;
+/// Diagnostic: dump the on-screen elements of the focused window.
+async fn dump_tree_cmd(session: &Session, all: bool) -> Result<()> {
+    let mut elements = session.elements().await?;
+    if !all {
+        elements.retain(|el| is_actionable(el.role, &el.states));
+    }
 
-    println!("{} actionable element(s):", elements.len());
+    let label = if all { "on-screen" } else { "actionable" };
+    println!("{} {label} element(s):", elements.len());
     for el in &elements {
         let path = el.object.path();
         println!("{:>14?} | {:<40} | {}", el.role, el.name, path);
