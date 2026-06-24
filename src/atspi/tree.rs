@@ -4,7 +4,11 @@ use atspi::{AccessibilityConnection, ObjectRefOwned, Role, State, StateSet};
 
 use super::Element;
 
-fn is_actionable(role: Role) -> bool {
+fn is_web_document(role: Role) -> bool {
+    matches!(role, Role::DocumentWeb | Role::DocumentFrame)
+}
+
+fn is_actionable_role(role: Role) -> bool {
     matches!(
         role,
         Role::Button
@@ -32,6 +36,12 @@ fn is_interactable(states: &StateSet) -> bool {
         && states.contains(State::Visible)
         // Some toolkits expose ENABLED, others SENSITIVE; accept either.
         && (states.contains(State::Enabled) || states.contains(State::Sensitive))
+}
+
+/// True if an element with this role and state set is a hint target: an
+/// actionable role that is currently interactable.
+pub fn is_actionable(role: Role, states: &StateSet) -> bool {
+    is_actionable_role(role) && is_interactable(states)
 }
 
 /// Find the active toplevel frame: walk applications under the registry root
@@ -75,22 +85,20 @@ pub async fn active_frame(conn: &AccessibilityConnection) -> Result<Option<Objec
     Ok(None)
 }
 
-/// Enumerate the actionable elements in the active application's subtree.
-pub async fn actionable_elements(conn: &AccessibilityConnection) -> Result<Vec<Element>> {
-    let frame = active_frame(conn)
-        .await?
-        .context("no active toplevel frame found (is a window focused, and a11y enabled?)")?;
-    walk(conn, frame).await
-}
-
-/// Walk a subtree (rooted at `frame`) collecting actionable elements.
-pub async fn walk(conn: &AccessibilityConnection, frame: ObjectRefOwned) -> Result<Vec<Element>> {
+/// Walk the subtree rooted at `frame`, yielding the on-screen elements that
+/// `keep` selects.
+pub async fn walk(
+    conn: &AccessibilityConnection,
+    frame: ObjectRefOwned,
+    keep: impl Fn(Role, &StateSet) -> bool,
+) -> Result<Vec<Element>> {
     let zconn = conn.connection();
 
     let mut out = Vec::new();
-    let mut stack = vec![frame];
+    // Each frame carries whether it is inside a web document (see prune below).
+    let mut stack = vec![(frame, false)];
 
-    while let Some(node) = stack.pop() {
+    while let Some((node, in_web_doc)) = stack.pop() {
         let proxy = match node.as_accessible_proxy(zconn).await {
             Ok(p) => p,
             Err(e) => {
@@ -104,22 +112,32 @@ pub async fn walk(conn: &AccessibilityConnection, frame: ObjectRefOwned) -> Resu
             Err(_) => continue,
         };
 
-        // Prune non-showing subtrees: if a container is not showing, its
-        // descendants are off-screen too, so don't descend.
-        if !states.contains(State::Showing) {
+        // Prune subtrees
+        //
+        // Normally, elements that are not SHOWING can be skipped, however in
+        // the context of a web document, SHOWING seems to be unreliable so
+        // fall back to pruning on VISIBLE instead.
+        let hidden = if in_web_doc {
+            !states.contains(State::Visible)
+        } else {
+            !states.contains(State::Showing)
+        };
+        if hidden {
             continue;
         }
 
         let role = proxy.get_role().await.unwrap_or(Role::Invalid);
-        if is_actionable(role) && is_interactable(&states) {
+        if keep(role, &states) {
             let name = proxy.name().await.unwrap_or_default();
             out.push(Element {
                 object: node.clone(),
                 role,
                 name,
+                states,
             });
         }
 
+        let child_in_web_doc = in_web_doc || is_web_document(role);
         for child in proxy
             .get_children()
             .await
@@ -127,7 +145,7 @@ pub async fn walk(conn: &AccessibilityConnection, frame: ObjectRefOwned) -> Resu
             .into_iter()
             .rev()
         {
-            stack.push(child);
+            stack.push((child, child_in_web_doc));
         }
     }
 

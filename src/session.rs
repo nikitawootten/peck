@@ -82,11 +82,19 @@ impl Session {
         Ok(Self { a11y })
     }
 
-    /// Enumerate the actionable elements in the focused window's accessibility
-    /// subtree (the per-invocation "fetch" phase).
-    pub async fn actionable_elements(&self) -> Result<Vec<Element>> {
+    /// Resolve the active toplevel frame, erroring when no window is focused
+    /// (or accessibility is disabled).
+    async fn active_frame(&self) -> Result<atspi::ObjectRefOwned> {
+        tree::active_frame(&self.a11y)
+            .await?
+            .context("no active toplevel frame found (is a window focused, and a11y enabled?)")
+    }
+
+    /// Enumerate every on-screen element in the focused window.
+    pub async fn elements(&self) -> Result<Vec<Element>> {
         let _p = Phase::start("tree");
-        tree::actionable_elements(&self.a11y).await
+        let frame = self.active_frame().await?;
+        tree::walk(&self.a11y, frame, |_, _| true).await
     }
 
     /// Enumerate actionable elements and resolve each to output-local physical
@@ -105,9 +113,7 @@ impl Session {
     /// geometry. Errors when the focused window exposes no accessibility
     /// frame — panel mode treats that as an empty element list instead.
     async fn located_in(&self, geom: &WindowGeometry) -> Result<Vec<(Element, PhysicalRect)>> {
-        let frame = tree::active_frame(&self.a11y)
-            .await?
-            .context("no active toplevel frame found (is a window focused, and a11y enabled?)")?;
+        let frame = self.active_frame().await?;
         self.located_in_frame(geom, frame).await
     }
 
@@ -133,7 +139,7 @@ impl Session {
 
         let elements = {
             let _p = Phase::start("tree");
-            tree::walk(&self.a11y, frame).await?
+            tree::walk(&self.a11y, frame, tree::is_actionable).await?
         };
 
         let _p = Phase::start("extents");
